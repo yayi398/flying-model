@@ -153,7 +153,7 @@ def load_crew_data(filepath: str) -> List[CrewMember]:
                 can_deadhead=row['Deadhead'] == 'Y',
                 base=row['Base'],
                 duty_cost_per_hour=float(row['DutyCostPerHour']),
-                pairing_cost_per_hour=float(row['ParingCostPerHour'])
+                pairing_cost_per_hour=float(row.get('PairingCostPerHour', row.get('ParingCostPerHour', '0')))
             )
             crew_members.append(crew)
     return crew_members
@@ -372,7 +372,7 @@ def calculate_fitness(chromosome: List[float], pairings: List[Pairing],
         
         # Use chromosome value to select pairing
         gene_idx = flight_idx % len(chromosome)
-        pairing_local_idx = int(chromosome[gene_idx] * len(available_pairings)) % len(available_pairings)
+        pairing_local_idx = min(int(chromosome[gene_idx] * len(available_pairings)), len(available_pairings) - 1)
         selected_pairing_idx = available_pairings[pairing_local_idx]
         selected_pairing = pairings[selected_pairing_idx]
         
@@ -508,16 +508,17 @@ class GeneticAlgorithm:
         return sorted(results, key=lambda x: x[0])
     
     def roulette_wheel_selection(self, evaluated_pop: List[Tuple[float, Schedule, List[float]]]) -> List[float]:
-        """Select parent using roulette wheel selection (fitness proportionate)"""
-        # Invert fitness since lower is better
-        max_fitness = max(e[0] for e in evaluated_pop)
-        inverted_fitness = [max_fitness - e[0] + 1 for e in evaluated_pop]
-        total = sum(inverted_fitness)
+        """Select parent using ranking-based selection (more robust than fitness proportionate)"""
+        # Use ranking-based selection to avoid numerical issues with large fitness values
+        n = len(evaluated_pop)
+        # Rank-based weights: higher rank (lower fitness) gets more weight
+        rank_weights = [n - i for i in range(n)]
+        total = sum(rank_weights)
         
         r = random.random() * total
         cumulative = 0
-        for i, inv_fit in enumerate(inverted_fitness):
-            cumulative += inv_fit
+        for i, weight in enumerate(rank_weights):
+            cumulative += weight
             if cumulative >= r:
                 return evaluated_pop[i][2]
         return evaluated_pop[-1][2]
@@ -527,9 +528,16 @@ class GeneticAlgorithm:
         if random.random() > CROSSOVER_RATE:
             return parent1.copy(), parent2.copy()
         
+        # Handle short chromosomes
+        if len(parent1) <= 2:
+            return parent1.copy(), parent2.copy()
+        
         # Select multiple crossover points
         num_points = random.randint(1, 3)
-        points = sorted(random.sample(range(1, len(parent1)), min(num_points, len(parent1)-1)))
+        max_points = min(num_points, len(parent1) - 1)
+        if max_points < 1:
+            return parent1.copy(), parent2.copy()
+        points = sorted(random.sample(range(1, len(parent1)), max_points))
         
         child1 = []
         child2 = []
@@ -718,15 +726,28 @@ def print_schedule_summary(schedule: Schedule, flights: List[Flight], crew_membe
 def main():
     """Main function to run the crew scheduling optimization"""
     import os
+    import argparse
     
     # Get the directory where this script is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
+    parser = argparse.ArgumentParser(description='Crew Scheduling Optimization using Genetic Algorithm')
+    parser.add_argument('--crew-file', default=os.path.join(script_dir, "机组排班Data A-Crew.csv"),
+                       help='Path to crew data CSV file')
+    parser.add_argument('--flight-file', default=os.path.join(script_dir, "机组排班Data A-Flight.csv"),
+                       help='Path to flight data CSV file')
+    parser.add_argument('--output-file', default=os.path.join(script_dir, "schedule_output.csv"),
+                       help='Path to output schedule CSV file')
+    parser.add_argument('--crew-output-file', default=os.path.join(script_dir, "crew_schedule_output.csv"),
+                       help='Path to crew schedule output CSV file')
+    
+    args = parser.parse_args()
+    
     # File paths
-    crew_file = os.path.join(script_dir, "机组排班Data A-Crew.csv")
-    flight_file = os.path.join(script_dir, "机组排班Data A-Flight.csv")
-    output_file = os.path.join(script_dir, "schedule_output.csv")
-    crew_output_file = os.path.join(script_dir, "crew_schedule_output.csv")
+    crew_file = args.crew_file
+    flight_file = args.flight_file
+    output_file = args.output_file
+    crew_output_file = args.crew_output_file
     
     print("Loading data...")
     crew_members = load_crew_data(crew_file)
