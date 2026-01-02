@@ -28,9 +28,9 @@ MAX_FLYING_TIME_PER_DUTY = 480  # Minutes (8 hours) per duty day
 MAX_FLYING_TIME_HORIZON = 2400  # Minutes (40 hours) in planning horizon
 MAX_ELAPSED_TIME_PER_DUTY = 720  # Minutes (12 hours) per duty
 
-# GA Parameters (from README.md)
-MAX_ITERATIONS = 150
-POPULATION_SIZE = 250
+# GA Parameters (from README.md) - default values, adjusted for large datasets
+DEFAULT_MAX_ITERATIONS = 150
+DEFAULT_POPULATION_SIZE = 250
 CROSSOVER_RATE = 0.6
 MUTATION_RATE = 0.25
 
@@ -39,6 +39,25 @@ UNCOVERED_FLIGHT_COST = 10000  # High penalty for uncovered flights
 DEADHEAD_COST = 500  # Cost for deadhead flights
 HOTEL_COST = 200  # Cost for crew staying overnight away from base
 CREW_USAGE_COST = 100  # Base cost for using a crew member
+
+
+def get_adaptive_ga_params(num_flights: int, num_crew: int) -> Tuple[int, int, int]:
+    """
+    Adjust GA parameters based on dataset size for better performance.
+    Returns (max_iterations, population_size, max_pairings)
+    """
+    if num_flights > 10000 or num_crew > 300:
+        # Very large dataset: minimal iterations, very small population
+        return 20, 30, 30000
+    elif num_flights > 5000 or num_crew > 200:
+        # Large dataset: reduce iterations and population, limit pairings
+        return 30, 50, 50000
+    elif num_flights > 1000 or num_crew > 50:
+        # Medium dataset
+        return 80, 100, 100000
+    else:
+        # Small dataset: use default parameters, unlimited pairings
+        return DEFAULT_MAX_ITERATIONS, DEFAULT_POPULATION_SIZE, 1000000
 
 
 @dataclass
@@ -146,14 +165,19 @@ def load_crew_data(filepath: str) -> List[CrewMember]:
     with open(filepath, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
+            # Handle different column name variants between datasets A and B
+            duty_cost = row.get('DutyCostPerHour', row.get('DutyCostPerHr', '0'))
+            pairing_cost = row.get('PairingCostPerHour', row.get('ParingCostPerHour', 
+                                   row.get('PairingCostPerHr', row.get('ParingCostPerHr', '0'))))
+            
             crew = CrewMember(
                 emp_no=row['EmpNo'],
                 is_captain=row['Captain'] == 'Y',
                 is_first_officer=row['FirstOfficer'] == 'Y',
                 can_deadhead=row['Deadhead'] == 'Y',
                 base=row['Base'],
-                duty_cost_per_hour=float(row['DutyCostPerHour']),
-                pairing_cost_per_hour=float(row.get('PairingCostPerHour', row.get('ParingCostPerHour', '0')))
+                duty_cost_per_hour=float(duty_cost),
+                pairing_cost_per_hour=float(pairing_cost)
             )
             crew_members.append(crew)
     return crew_members
@@ -207,15 +231,17 @@ def can_connect_flights(flight1: Flight, flight2: Flight) -> bool:
     return sit_time >= MIN_REST_TIME
 
 
-def generate_pairings(flights: List[Flight], base_city: str, max_flights: int = 4) -> List[Pairing]:
+def generate_pairings(flights: List[Flight], base_city: str, max_flights: int = 4, 
+                      max_pairings: int = 100000) -> List[Pairing]:
     """
-    Generate all feasible pairings starting and ending at the base city.
+    Generate feasible pairings starting and ending at the base city.
     A pairing can have 1-4 flights following FAA rules.
-    Also handles special cases where flights start/end at base city.
+    
+    For large datasets, limits total pairings to max_pairings for performance.
     """
     pairings = []
     
-    # Group flights by date
+    # Group flights by date for efficient lookup
     flights_by_date = {}
     for flight in flights:
         date_key = flight.departure_date.date()
@@ -223,109 +249,99 @@ def generate_pairings(flights: List[Flight], base_city: str, max_flights: int = 
             flights_by_date[date_key] = []
         flights_by_date[date_key].append(flight)
     
+    # Pre-index flights by departure station and date for faster lookups
+    flights_by_station_date = {}
+    for flight in flights:
+        key = (flight.departure_station, flight.departure_date.date())
+        if key not in flights_by_station_date:
+            flights_by_station_date[key] = []
+        flights_by_station_date[key].append(flight)
+    
+    # Helper function to find connecting flights efficiently
+    def find_connecting_flights(prev_flight):
+        key = (prev_flight.arrival_station, prev_flight.arrival_date.date())
+        candidates = flights_by_station_date.get(key, [])
+        return [f for f in candidates if can_connect_flights(prev_flight, f)]
+    
     # Generate single-flight pairings for flights that end at base (deadhead home)
     for date, day_flights in flights_by_date.items():
-        # Flights that arrive at base (crew can deadhead out, fly back)
         inbound_only = [f for f in day_flights if f.arrival_station == base_city]
         for flight in inbound_only:
+            if len(pairings) >= max_pairings:
+                break
             pairing = Pairing(
                 flights=[flight],
-                start_city=flight.departure_station,  # Deadhead to departure
+                start_city=flight.departure_station,
                 end_city=base_city
             )
             if (pairing.total_flying_time <= MAX_FLYING_TIME_PER_DUTY and
                 pairing.elapsed_time <= MAX_ELAPSED_TIME_PER_DUTY):
                 pairings.append(pairing)
+        if len(pairings) >= max_pairings:
+            break
     
-    # Generate single round-trip pairings (2 flights: base -> city -> base)
+    # Generate 2-flight round-trip pairings (base -> city -> base) - most efficient
     for date, day_flights in flights_by_date.items():
+        if len(pairings) >= max_pairings:
+            break
         outbound = [f for f in day_flights if f.departure_station == base_city]
         
         for out_flight in outbound:
-            # Find return flights
-            return_flights = [f for f in day_flights 
-                           if f.departure_station == out_flight.arrival_station 
-                           and f.arrival_station == base_city]
+            if len(pairings) >= max_pairings:
+                break
+            # Find return flights using index
+            key = (out_flight.arrival_station, out_flight.arrival_date.date())
+            return_candidates = flights_by_station_date.get(key, [])
+            return_flights = [f for f in return_candidates 
+                           if f.arrival_station == base_city and can_connect_flights(out_flight, f)]
             
             for ret_flight in return_flights:
-                if can_connect_flights(out_flight, ret_flight):
-                    pairing = Pairing(
-                        flights=[out_flight, ret_flight],
-                        start_city=base_city,
-                        end_city=base_city
-                    )
-                    # Validate pairing constraints
-                    if (pairing.total_flying_time <= MAX_FLYING_TIME_PER_DUTY and
-                        pairing.elapsed_time <= MAX_ELAPSED_TIME_PER_DUTY):
-                        pairings.append(pairing)
+                pairing = Pairing(
+                    flights=[out_flight, ret_flight],
+                    start_city=base_city,
+                    end_city=base_city
+                )
+                if (pairing.total_flying_time <= MAX_FLYING_TIME_PER_DUTY and
+                    pairing.elapsed_time <= MAX_ELAPSED_TIME_PER_DUTY):
+                    pairings.append(pairing)
+                    if len(pairings) >= max_pairings:
+                        break
     
-    # Generate 3-flight pairings to cover orphan return flights 
-    # (e.g., outbound + 2 return flights from same intermediate city)
-    for date, day_flights in flights_by_date.items():
-        outbound = [f for f in day_flights if f.departure_station == base_city]
-        
-        for f1 in outbound:
-            # f1: base -> city_A
-            return_from_A = [f for f in day_flights 
-                           if f.departure_station == f1.arrival_station 
-                           and f.arrival_station == base_city
-                           and can_connect_flights(f1, f)]
+    # For small datasets, also generate 4-flight pairings
+    # For large datasets, skip this expensive step
+    if len(flights) <= 1000 and len(pairings) < max_pairings:
+        for date, day_flights in flights_by_date.items():
+            if len(pairings) >= max_pairings:
+                break
+            outbound1 = [f for f in day_flights if f.departure_station == base_city]
             
-            # Look for 3-flight patterns: base -> A, A -> base, base -> B -> base
-            for f2 in return_from_A:
-                outbound_after = [f for f in day_flights
-                                 if f.departure_station == base_city
-                                 and can_connect_flights(f2, f)]
+            for f1 in outbound1:
+                if len(pairings) >= max_pairings:
+                    break
+                connecting_f1 = find_connecting_flights(f1)
                 
-                for f3 in outbound_after:
-                    return_f3 = [f for f in day_flights
-                                if f.departure_station == f3.arrival_station
-                                and f.arrival_station == base_city
-                                and can_connect_flights(f3, f)]
+                for f2 in connecting_f1:
+                    if len(pairings) >= max_pairings:
+                        break
+                    connecting_f2 = find_connecting_flights(f2)
                     
-                    for f4 in return_f3:
-                        pairing = Pairing(
-                            flights=[f1, f2, f3, f4],
-                            start_city=base_city,
-                            end_city=base_city
-                        )
-                        if (pairing.total_flying_time <= MAX_FLYING_TIME_PER_DUTY and
-                            pairing.elapsed_time <= MAX_ELAPSED_TIME_PER_DUTY):
-                            pairings.append(pairing)
-    
-    # Generate 4-flight pairings (base -> A -> base -> B -> base or base -> A -> B -> A -> base)
-    for date, day_flights in flights_by_date.items():
-        outbound1 = [f for f in day_flights if f.departure_station == base_city]
-        
-        for f1 in outbound1:
-            # f1: base -> city_A
-            inbound1 = [f for f in day_flights 
-                       if f.departure_station == f1.arrival_station 
-                       and can_connect_flights(f1, f)]
-            
-            for f2 in inbound1:
-                # f2: city_A -> city_B (or back to base)
-                outbound2 = [f for f in day_flights
-                            if f.departure_station == f2.arrival_station
-                            and can_connect_flights(f2, f)]
-                
-                for f3 in outbound2:
-                    # f3: city_B -> city_C
-                    inbound2 = [f for f in day_flights
-                               if f.departure_station == f3.arrival_station
-                               and f.arrival_station == base_city
-                               and can_connect_flights(f3, f)]
-                    
-                    for f4 in inbound2:
-                        # f4: city_C -> base
-                        pairing = Pairing(
-                            flights=[f1, f2, f3, f4],
-                            start_city=base_city,
-                            end_city=base_city
-                        )
-                        if (pairing.total_flying_time <= MAX_FLYING_TIME_PER_DUTY and
-                            pairing.elapsed_time <= MAX_ELAPSED_TIME_PER_DUTY):
-                            pairings.append(pairing)
+                    for f3 in connecting_f2:
+                        if len(pairings) >= max_pairings:
+                            break
+                        connecting_f3 = [f for f in find_connecting_flights(f3) 
+                                        if f.arrival_station == base_city]
+                        
+                        for f4 in connecting_f3:
+                            pairing = Pairing(
+                                flights=[f1, f2, f3, f4],
+                                start_city=base_city,
+                                end_city=base_city
+                            )
+                            if (pairing.total_flying_time <= MAX_FLYING_TIME_PER_DUTY and
+                                pairing.elapsed_time <= MAX_ELAPSED_TIME_PER_DUTY):
+                                pairings.append(pairing)
+                                if len(pairings) >= max_pairings:
+                                    break
     
     return pairings
 
@@ -347,21 +363,44 @@ def calculate_fitness(chromosome: List[float], pairings: List[Pairing],
     """
     Calculate fitness of a chromosome and return the corresponding schedule.
     Lower fitness is better (cost minimization).
+    
+    Optimized for large datasets with efficient greedy assignment.
     """
     schedule = Schedule()
     covered_flights = set()
     crew_total_flying = {c.emp_no: 0 for c in captains + first_officers}
     crew_assignments_per_day = {c.emp_no: {} for c in captains + first_officers}
     
+    # For large datasets, use a sampling approach to speed up
+    num_flights = len(flights)
+    use_sampling = num_flights > 5000
+    
     # Sort flights by number of available pairings (ascending) - prioritize harder flights
-    flight_order = sorted(range(len(flights)), 
-                         key=lambda fid: len(flight_to_pairings.get(fid, [])))
+    if use_sampling:
+        # For large datasets, sample a subset of flights for ordering
+        sample_size = min(2000, num_flights)
+        import random as random_module
+        sample_indices = random_module.sample(range(num_flights), sample_size)
+        flight_order = sorted(sample_indices, 
+                             key=lambda fid: len(flight_to_pairings.get(fid, [])))
+        # Add remaining flights
+        remaining = [i for i in range(num_flights) if i not in set(sample_indices)]
+        flight_order.extend(remaining)
+    else:
+        flight_order = sorted(range(num_flights), 
+                             key=lambda fid: len(flight_to_pairings.get(fid, [])))
     
     # Assign pairings based on chromosome
     captain_idx = 0
     fo_idx = 0
     
-    for flight_idx in flight_order:
+    # Limit iterations for large datasets
+    max_iterations = min(len(flight_order), 50000)
+    
+    for i, flight_idx in enumerate(flight_order):
+        if i >= max_iterations:
+            break
+            
         if flight_idx in covered_flights:
             continue
             
@@ -379,9 +418,10 @@ def calculate_fitness(chromosome: List[float], pairings: List[Pairing],
         # Check if all flights in pairing are still available
         pairing_flights_ids = [f.flight_id for f in selected_pairing.flights]
         if any(fid in covered_flights for fid in pairing_flights_ids):
-            # Try to find another pairing
+            # Try to find another pairing (limit search)
             found = False
-            for alt_idx in available_pairings:
+            search_limit = min(len(available_pairings), 10)  # Limit search
+            for alt_idx in available_pairings[:search_limit]:
                 alt_pairing = pairings[alt_idx]
                 alt_flight_ids = [f.flight_id for f in alt_pairing.flights]
                 if not any(fid in covered_flights for fid in alt_flight_ids):
@@ -391,9 +431,10 @@ def calculate_fitness(chromosome: List[float], pairings: List[Pairing],
             if not found:
                 continue
         
-        # Assign captain
+        # Assign captain (limit search)
         assigned_captain = None
-        for _ in range(len(captains)):
+        search_limit = min(len(captains), 50)
+        for _ in range(search_limit):
             captain = captains[captain_idx % len(captains)]
             captain_idx += 1
             
@@ -408,9 +449,10 @@ def calculate_fitness(chromosome: List[float], pairings: List[Pairing],
             assigned_captain = captain
             break
         
-        # Assign first officer
+        # Assign first officer (limit search)
         assigned_fo = None
-        for _ in range(len(first_officers)):
+        search_limit = min(len(first_officers), 50)
+        for _ in range(search_limit):
             fo = first_officers[fo_idx % len(first_officers)]
             fo_idx += 1
             
@@ -476,35 +518,153 @@ def calculate_fitness(chromosome: List[float], pairings: List[Pairing],
     return cost, schedule
 
 
+def greedy_solve(pairings: List[Pairing], flights: List[Flight],
+                 captains: List[CrewMember], first_officers: List[CrewMember]) -> Tuple[Schedule, float]:
+    """
+    Greedy solver for large datasets - faster than GA but may not find optimal solution.
+    Sorts pairings by number of flights covered and greedily assigns crew.
+    """
+    print("Using greedy solver for large dataset...")
+    
+    schedule = Schedule()
+    covered_flights = set()
+    crew_total_flying = {c.emp_no: 0 for c in captains + first_officers}
+    crew_assignments_per_day = {c.emp_no: {} for c in captains + first_officers}
+    
+    # Sort pairings by number of flights (descending) to maximize coverage
+    sorted_pairings = sorted(pairings, key=lambda p: len(p.flights), reverse=True)
+    
+    captain_idx = 0
+    fo_idx = 0
+    
+    total_pairings = len(sorted_pairings)
+    for i, pairing in enumerate(sorted_pairings):
+        if i % 1000 == 0:
+            print(f"  Processing pairing {i+1}/{total_pairings}, covered: {len(covered_flights)}/{len(flights)}...", end='\r')
+        
+        # Check if any flight in pairing is already covered
+        pairing_flights_ids = [f.flight_id for f in pairing.flights]
+        if any(fid in covered_flights for fid in pairing_flights_ids):
+            continue
+        
+        # Try to assign captain
+        assigned_captain = None
+        pairing_date = pairing.flights[0].departure_date.date()
+        
+        for _ in range(min(len(captains), 100)):
+            captain = captains[captain_idx % len(captains)]
+            captain_idx += 1
+            
+            if pairing_date in crew_assignments_per_day.get(captain.emp_no, {}):
+                continue
+            if crew_total_flying.get(captain.emp_no, 0) + pairing.total_flying_time > MAX_FLYING_TIME_HORIZON:
+                continue
+            
+            assigned_captain = captain
+            break
+        
+        if not assigned_captain:
+            continue
+        
+        # Try to assign first officer
+        assigned_fo = None
+        for _ in range(min(len(first_officers), 100)):
+            fo = first_officers[fo_idx % len(first_officers)]
+            fo_idx += 1
+            
+            if fo.emp_no == assigned_captain.emp_no:
+                continue
+            if pairing_date in crew_assignments_per_day.get(fo.emp_no, {}):
+                continue
+            if crew_total_flying.get(fo.emp_no, 0) + pairing.total_flying_time > MAX_FLYING_TIME_HORIZON:
+                continue
+            
+            assigned_fo = fo
+            break
+        
+        if not assigned_fo:
+            continue
+        
+        # Create assignments
+        schedule.assignments.append(CrewAssignment(
+            crew=assigned_captain,
+            pairing=pairing,
+            role='Captain'
+        ))
+        schedule.assignments.append(CrewAssignment(
+            crew=assigned_fo,
+            pairing=pairing,
+            role='FirstOfficer'
+        ))
+        
+        # Update tracking
+        for flight in pairing.flights:
+            covered_flights.add(flight.flight_id)
+        
+        crew_total_flying[assigned_captain.emp_no] += pairing.total_flying_time
+        crew_total_flying[assigned_fo.emp_no] += pairing.total_flying_time
+        crew_assignments_per_day[assigned_captain.emp_no][pairing_date] = True
+        crew_assignments_per_day[assigned_fo.emp_no][pairing_date] = True
+    
+    print()  # New line after progress
+    
+    # Mark uncovered flights
+    for flight in flights:
+        if flight.flight_id not in covered_flights:
+            schedule.uncovered_flights.add(flight.flight_id)
+    
+    # Calculate cost
+    cost = len(schedule.uncovered_flights) * UNCOVERED_FLIGHT_COST
+    used_crew = set(a.crew.emp_no for a in schedule.assignments)
+    cost += len(used_crew) * CREW_USAGE_COST
+    
+    for assignment in schedule.assignments:
+        hours = assignment.pairing.total_flying_time / 60
+        cost += hours * assignment.crew.duty_cost_per_hour
+    
+    return schedule, cost
+
+
 class GeneticAlgorithm:
     """Genetic Algorithm for Crew Scheduling Problem"""
     
     def __init__(self, pairings: List[Pairing], flights: List[Flight],
-                 captains: List[CrewMember], first_officers: List[CrewMember]):
+                 captains: List[CrewMember], first_officers: List[CrewMember],
+                 max_iterations: int = DEFAULT_MAX_ITERATIONS, 
+                 population_size: int = DEFAULT_POPULATION_SIZE):
         self.pairings = pairings
         self.flights = flights
         self.captains = captains
         self.first_officers = first_officers
         self.flight_to_pairings = get_flight_pairings_map(pairings)
         self.chromosome_length = len(flights)
+        self.max_iterations = max_iterations
+        self.population_size = population_size
         
     def initialize_population(self) -> List[List[float]]:
         """Initialize population with random chromosomes"""
         population = []
-        for _ in range(POPULATION_SIZE):
+        for _ in range(self.population_size):
             chromosome = [random.random() for _ in range(self.chromosome_length)]
             population.append(chromosome)
+        return population
         return population
     
     def evaluate_population(self, population: List[List[float]]) -> List[Tuple[float, Schedule, List[float]]]:
         """Evaluate fitness of all chromosomes"""
         results = []
-        for chromosome in population:
+        total = len(population)
+        large_dataset = len(self.flights) > 5000
+        for i, chromosome in enumerate(population):
+            if large_dataset and i % 10 == 0:
+                print(f"  Evaluating chromosome {i+1}/{total}...", end='\r')
             fitness, schedule = calculate_fitness(
                 chromosome, self.pairings, self.flights,
                 self.flight_to_pairings, self.captains, self.first_officers
             )
             results.append((fitness, schedule, chromosome))
+        if large_dataset:
+            print()  # New line after progress
         return sorted(results, key=lambda x: x[0])
     
     def roulette_wheel_selection(self, evaluated_pop: List[Tuple[float, Schedule, List[float]]]) -> List[float]:
@@ -571,7 +731,7 @@ class GeneticAlgorithm:
         best_schedule = None
         no_improvement_count = 0
         
-        for iteration in range(MAX_ITERATIONS):
+        for iteration in range(self.max_iterations):
             evaluated_pop = self.evaluate_population(population)
             
             # Track best solution
@@ -595,12 +755,12 @@ class GeneticAlgorithm:
             new_population = []
             
             # Elitism: keep top 10% of population
-            elite_size = max(1, POPULATION_SIZE // 10)
+            elite_size = max(1, self.population_size // 10)
             for i in range(elite_size):
                 new_population.append(evaluated_pop[i][2])
             
             # Fill rest with offspring
-            while len(new_population) < POPULATION_SIZE:
+            while len(new_population) < self.population_size:
                 parent1 = self.roulette_wheel_selection(evaluated_pop)
                 parent2 = self.roulette_wheel_selection(evaluated_pop)
                 
@@ -609,7 +769,7 @@ class GeneticAlgorithm:
                 child2 = self.mutate(child2)
                 
                 new_population.append(child1)
-                if len(new_population) < POPULATION_SIZE:
+                if len(new_population) < self.population_size:
                     new_population.append(child2)
             
             population = new_population
@@ -763,24 +923,43 @@ def main():
     print(f"Captains: {len(captains)}")
     print(f"First Officers: {len(first_officers)}")
     
-    # Get base city (all crew have same base in this dataset)
-    base_city = crew_members[0].base
-    print(f"Base city: {base_city}")
+    # Get all unique base cities from crew members
+    base_cities = list(set(c.base for c in crew_members))
+    print(f"Base cities: {base_cities}")
     
+    # Get adaptive GA parameters based on dataset size
+    max_iterations, population_size, max_pairings = get_adaptive_ga_params(len(flights), len(crew_members))
+    # Calculate max pairings per base
+    max_pairings_per_base = max_pairings // len(base_cities) if base_cities else max_pairings
+    
+    # Generate pairings for all base cities
     print("\nGenerating feasible pairings...")
-    pairings = generate_pairings(flights, base_city)
-    print(f"Generated {len(pairings)} feasible pairings")
+    all_pairings = []
+    for base_city in base_cities:
+        pairings = generate_pairings(flights, base_city, max_pairings=max_pairings_per_base)
+        all_pairings.extend(pairings)
+        print(f"  Base {base_city}: {len(pairings)} pairings")
     
-    if not pairings:
+    print(f"Total generated: {len(all_pairings)} feasible pairings")
+    
+    if not all_pairings:
         print("ERROR: No feasible pairings found. Check flight data and constraints.")
         return
     
-    print("\nRunning Genetic Algorithm optimization...")
-    print(f"Parameters: iterations={MAX_ITERATIONS}, population={POPULATION_SIZE}, "
-          f"crossover={CROSSOVER_RATE}, mutation={MUTATION_RATE}")
+    # Use greedy solver for very large datasets, GA for smaller ones
+    use_greedy = len(flights) > 5000 or len(crew_members) > 200
     
-    ga = GeneticAlgorithm(pairings, flights, captains, first_officers)
-    best_schedule, best_fitness = ga.run()
+    if use_greedy:
+        print("\nRunning greedy optimization (large dataset)...")
+        best_schedule, best_fitness = greedy_solve(all_pairings, flights, captains, first_officers)
+    else:
+        print("\nRunning Genetic Algorithm optimization...")
+        print(f"Parameters: iterations={max_iterations}, population={population_size}, "
+              f"crossover={CROSSOVER_RATE}, mutation={MUTATION_RATE}")
+        
+        ga = GeneticAlgorithm(all_pairings, flights, captains, first_officers, 
+                              max_iterations, population_size)
+        best_schedule, best_fitness = ga.run()
     
     print(f"\nOptimization complete. Best fitness: {best_fitness:.2f}")
     

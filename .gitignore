@@ -1,0 +1,12 @@
+# Output files for large dataset B
+schedule_output_B.csv
+crew_schedule_output_B.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE files
+.vscode/
+.idea/
