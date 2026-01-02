@@ -648,7 +648,6 @@ class GeneticAlgorithm:
             chromosome = [random.random() for _ in range(self.chromosome_length)]
             population.append(chromosome)
         return population
-        return population
     
     def evaluate_population(self, population: List[List[float]]) -> List[Tuple[float, Schedule, List[float]]]:
         """Evaluate fitness of all chromosomes"""
