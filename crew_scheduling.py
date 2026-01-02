@@ -15,8 +15,9 @@ Extended features:
 - Deadhead (空驶): Crew can travel as passenger to another city
   - Deadhead time does NOT count as flying time
   - Deadhead time counts as duty/work time
-  - Deadhead time >= 30 min can serve as rest time between flights
+  - Any deadhead time can serve as rest time between consecutive operational flights
 - Crew can end duty at non-home base (with hotel cost)
+- 5-days-work / 2-days-rest: Crew must rest 2 days after every 5 consecutive working days
 - No pairing generation limit
 - Progress and timing output during solving
 """
@@ -35,6 +36,8 @@ MIN_REST_TIME = 600  # Minutes (10 hours) between duty days
 MAX_FLYING_TIME_PER_DUTY = 480  # Minutes (8 hours) per duty day
 MAX_FLYING_TIME_HORIZON = 2400  # Minutes (40 hours) in planning horizon
 MAX_DUTY_TIME_PER_DUTY = 720  # Minutes (12 hours) per duty (including deadhead)
+MAX_CONSECUTIVE_WORK_DAYS = 5  # Must rest after 5 consecutive working days
+MIN_REST_DAYS_AFTER_WORK = 2  # Must rest 2 days after 5 consecutive work days
 
 # GA Parameters (from README.md) - default values
 DEFAULT_MAX_ITERATIONS = 150
@@ -303,7 +306,9 @@ def can_connect_with_deadhead_rest(flight1: Flight, deadhead_flight: Flight, fli
     """Check if deadhead flight between two operational flights provides sufficient rest.
     
     The rule: if crew flies flight1, then deadheads on deadhead_flight, then flies flight2,
-    the deadhead time can count as rest time if >= 30 minutes.
+    ANY deadhead time can count as rest time between the two operational flights.
+    The total gap from flight1 arrival to flight2 departure (including deadhead) must satisfy
+    the minimum sit time constraint.
     """
     # Deadhead must connect properly
     if flight1.arrival_station != deadhead_flight.departure_station:
@@ -322,16 +327,14 @@ def can_connect_with_deadhead_rest(flight1: Flight, deadhead_flight: Flight, fli
     if sit_before_dh < MIN_SIT_TIME:
         return False
     
-    # Deadhead flight duration acts as rest time
-    dh_duration = deadhead_flight.duration_minutes
-    
     # Sit time after deadhead to flight2
     sit_after_dh = (f2_departure - dh_arrival).total_seconds() / 60
     if sit_after_dh < MIN_SIT_TIME:
         return False
     
-    # The deadhead duration itself can serve as rest if >= MIN_SIT_TIME
-    return dh_duration >= MIN_SIT_TIME
+    # Any deadhead duration counts as rest - no minimum duration requirement
+    # The deadhead time plus sit times contribute to the gap between operational flights
+    return True
 
 
 def generate_pairings(flights: List[Flight], base_city: str, all_cities: Set[str],
@@ -575,6 +578,55 @@ def get_flight_pairings_map(pairings: List[Pairing]) -> Dict[int, List[int]]:
     return flight_to_pairings
 
 
+def check_consecutive_work_days_constraint(work_days: Dict, new_date) -> bool:
+    """
+    Check if assigning a new work day would violate the 5-consecutive-days / 2-days-rest constraint.
+    
+    Rules:
+    - Crew can work at most 5 consecutive days
+    - After 5 consecutive days, crew must rest for 2 days
+    
+    Args:
+        work_days: Dictionary mapping dates to True for days worked
+        new_date: The proposed new work date
+    
+    Returns:
+        True if the new assignment is allowed, False if it would violate the constraint
+    """
+    if not work_days:
+        return True
+    
+    # Convert work_days keys to a sorted list of dates
+    worked_dates = sorted(work_days.keys())
+    
+    # Create a set for O(1) lookup
+    worked_set = set(worked_dates)
+    
+    # Add the new date temporarily
+    test_dates = worked_set | {new_date}
+    
+    # Check for any sequence of more than MAX_CONSECUTIVE_WORK_DAYS consecutive days
+    all_dates = sorted(test_dates)
+    
+    # Track consecutive work days
+    consecutive = 1
+    for i in range(1, len(all_dates)):
+        # Check if this date is consecutive to the previous one
+        if (all_dates[i] - all_dates[i-1]).days == 1:
+            consecutive += 1
+            if consecutive > MAX_CONSECUTIVE_WORK_DAYS:
+                return False  # Would exceed 5 consecutive days
+        else:
+            # Check if there's a gap and if rest was sufficient after a 5-day streak
+            gap_days = (all_dates[i] - all_dates[i-1]).days - 1
+            if consecutive == MAX_CONSECUTIVE_WORK_DAYS and gap_days < MIN_REST_DAYS_AFTER_WORK:
+                # Worked 5 days but didn't rest enough before working again
+                return False
+            consecutive = 1
+    
+    return True
+
+
 def calculate_fitness(chromosome: List[float], pairings: List[Pairing], 
                      flights: List[Flight], flight_to_pairings: Dict[int, List[int]],
                      captains: List[CrewMember], first_officers: List[CrewMember]) -> Tuple[float, Schedule]:
@@ -664,6 +716,10 @@ def calculate_fitness(chromosome: List[float], pairings: List[Pairing],
             if crew_total_flying[captain.emp_no] + selected_pairing.total_flying_time > MAX_FLYING_TIME_HORIZON:
                 continue
             
+            # Check 5-consecutive-days constraint
+            if not check_consecutive_work_days_constraint(crew_assignments_per_day[captain.emp_no], pairing_date):
+                continue
+            
             assigned_captain = captain
             break
         
@@ -683,6 +739,10 @@ def calculate_fitness(chromosome: List[float], pairings: List[Pairing],
                 continue
             
             if crew_total_flying[fo.emp_no] + selected_pairing.total_flying_time > MAX_FLYING_TIME_HORIZON:
+                continue
+            
+            # Check 5-consecutive-days constraint
+            if not check_consecutive_work_days_constraint(crew_assignments_per_day[fo.emp_no], pairing_date):
                 continue
             
             assigned_fo = fo
@@ -787,6 +847,9 @@ def greedy_solve(pairings: List[Pairing], flights: List[Flight],
                 continue
             if crew_total_flying.get(captain.emp_no, 0) + pairing.total_flying_time > MAX_FLYING_TIME_HORIZON:
                 continue
+            # Check 5-consecutive-days constraint
+            if not check_consecutive_work_days_constraint(crew_assignments_per_day.get(captain.emp_no, {}), pairing_date):
+                continue
             
             assigned_captain = captain
             break
@@ -805,6 +868,9 @@ def greedy_solve(pairings: List[Pairing], flights: List[Flight],
             if pairing_date in crew_assignments_per_day.get(fo.emp_no, {}):
                 continue
             if crew_total_flying.get(fo.emp_no, 0) + pairing.total_flying_time > MAX_FLYING_TIME_HORIZON:
+                continue
+            # Check 5-consecutive-days constraint
+            if not check_consecutive_work_days_constraint(crew_assignments_per_day.get(fo.emp_no, {}), pairing_date):
                 continue
             
             assigned_fo = fo
