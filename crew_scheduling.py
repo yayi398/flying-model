@@ -9,9 +9,8 @@ This implementation schedules crew members to flights while satisfying:
 - Maximum flying time per duty (8 hours = 480 minutes)
 - Maximum flying time in planning horizon (40 hours = 2400 minutes)
 - Maximum elapsed time per duty (12 hours = 720 minutes)
-- Maximum work time per duty (14 hours = 840 minutes, includes deadhead)
-- Crew can stay overnight in remote cities (with hotel cost)
-- Crew can deadhead (travel as passenger) to reach destinations
+- Crew must start first duty from home base
+- Crew must return to home base at end of last duty
 - Each flight needs a Captain and First Officer (2 crew members)
 """
 
@@ -28,7 +27,6 @@ MIN_REST_TIME = 600  # Minutes (10 hours) between duty days
 MAX_FLYING_TIME_PER_DUTY = 480  # Minutes (8 hours) per duty day
 MAX_FLYING_TIME_HORIZON = 2400  # Minutes (40 hours) in planning horizon
 MAX_ELAPSED_TIME_PER_DUTY = 720  # Minutes (12 hours) per duty
-MAX_WORK_TIME_PER_DUTY = 840  # Minutes (14 hours) per duty including deadhead
 
 # GA Parameters (from README.md) - default values, adjusted for large datasets
 DEFAULT_MAX_ITERATIONS = 150
@@ -38,8 +36,8 @@ MUTATION_RATE = 0.25
 
 # Cost parameters
 UNCOVERED_FLIGHT_COST = 10000  # High penalty for uncovered flights
-DEADHEAD_COST = 500  # Cost for deadhead flights (per flight)
-HOTEL_COST = 200  # Cost for crew staying overnight away from base (per night)
+DEADHEAD_COST = 500  # Cost for deadhead flights
+HOTEL_COST = 200  # Cost for crew staying overnight away from base
 CREW_USAGE_COST = 100  # Base cost for using a crew member
 
 
@@ -49,14 +47,14 @@ def get_adaptive_ga_params(num_flights: int, num_crew: int) -> Tuple[int, int, i
     Returns (max_iterations, population_size, max_pairings)
     """
     if num_flights > 10000 or num_crew > 300:
-        # Very large dataset: more pairings for better coverage
-        return 20, 30, 100000
+        # Very large dataset: minimal iterations, very small population
+        return 20, 30, 30000
     elif num_flights > 5000 or num_crew > 200:
-        # Large dataset: reduce iterations and population, more pairings
-        return 30, 50, 80000
+        # Large dataset: reduce iterations and population, limit pairings
+        return 30, 50, 50000
     elif num_flights > 1000 or num_crew > 50:
         # Medium dataset
-        return 80, 100, 150000
+        return 80, 100, 100000
     else:
         # Small dataset: use default parameters, unlimited pairings
         return DEFAULT_MAX_ITERATIONS, DEFAULT_POPULATION_SIZE, 1000000
@@ -103,26 +101,14 @@ class Flight:
 
 @dataclass
 class Pairing:
-    """A pairing is a sequence of flights that can be assigned to a crew member.
-    
-    Can span multiple days with overnight stays.
-    Flights can be operational (flying) or deadhead (passenger).
-    """
+    """A pairing is a sequence of flights that can be assigned to a crew member"""
     flights: List[Flight]
     start_city: str
     end_city: str
-    deadhead_flights: List[int] = field(default_factory=list)  # Indices of flights where crew is deadheading
-    hotel_nights: int = 0  # Number of overnight stays away from base
     
     @property
     def total_flying_time(self) -> int:
-        """Total flying time in minutes (excludes deadhead flights)"""
-        return sum(f.duration_minutes for i, f in enumerate(self.flights) 
-                   if i not in self.deadhead_flights)
-    
-    @property
-    def total_work_time(self) -> int:
-        """Total work time in minutes (includes deadhead flights)"""
+        """Total flying time in minutes"""
         return sum(f.duration_minutes for f in self.flights)
     
     @property
@@ -135,11 +121,6 @@ class Pairing:
         start = datetime.combine(first_flight.departure_date.date(), first_flight.departure_time.time())
         end = datetime.combine(last_flight.arrival_date.date(), last_flight.arrival_time.time())
         return int((end - start).total_seconds() / 60)
-    
-    @property
-    def num_deadhead_flights(self) -> int:
-        """Number of deadhead flights in this pairing"""
-        return len(self.deadhead_flights)
 
 
 @dataclass
@@ -148,14 +129,6 @@ class CrewAssignment:
     crew: CrewMember
     pairing: Pairing
     role: str  # 'Captain' or 'FirstOfficer'
-    
-    def get_flight_role(self, flight_idx: int) -> str:
-        """Get the role for a specific flight in the pairing.
-        Returns 'Captain', 'FirstOfficer', or 'Deadhead'
-        """
-        if flight_idx in self.pairing.deadhead_flights:
-            return 'Deadhead'
-        return self.role
 
 
 @dataclass
@@ -238,20 +211,11 @@ def load_flight_data(filepath: str) -> List[Flight]:
     return flights
 
 
-def can_connect_flights(flight1: Flight, flight2: Flight, allow_overnight: bool = False) -> Tuple[bool, bool]:
-    """Check if two flights can be connected.
-    
-    Args:
-        flight1: First flight
-        flight2: Second flight
-        allow_overnight: If True, allows overnight stay between flights
-        
-    Returns:
-        Tuple of (can_connect, requires_overnight)
-    """
+def can_connect_flights(flight1: Flight, flight2: Flight) -> bool:
+    """Check if two flights can be connected in the same duty day"""
     # Flight 2 must depart after flight 1 arrives
     if flight1.arrival_station != flight2.departure_station:
-        return False, False
+        return False
     
     # Calculate time between flights
     arrival = datetime.combine(flight1.arrival_date.date(), flight1.arrival_time.time())
@@ -259,36 +223,19 @@ def can_connect_flights(flight1: Flight, flight2: Flight, allow_overnight: bool 
     
     sit_time = (departure - arrival).total_seconds() / 60
     
-    # Same day connection
+    # Check minimum sit time (same day)
     if flight1.arrival_date.date() == flight2.departure_date.date():
-        return sit_time >= MIN_SIT_TIME, False
+        return sit_time >= MIN_SIT_TIME
     
-    # Different day - check if overnight stay is allowed
-    if allow_overnight and sit_time >= MIN_REST_TIME:
-        return True, True
-    elif sit_time >= MIN_REST_TIME:
-        # Connection across days but no overnight needed (e.g., late night arrival, early morning departure)
-        return True, False
-    
-    return False, False
-
-
-def can_connect_flights_simple(flight1: Flight, flight2: Flight) -> bool:
-    """Simple version for backward compatibility - check if two flights can connect same day"""
-    can_conn, _ = can_connect_flights(flight1, flight2, allow_overnight=False)
-    return can_conn
+    # Check minimum rest time (different days)
+    return sit_time >= MIN_REST_TIME
 
 
 def generate_pairings(flights: List[Flight], base_city: str, max_flights: int = 4, 
-                      max_pairings: int = 100000, allow_overnight: bool = True,
-                      allow_deadhead: bool = True) -> List[Pairing]:
+                      max_pairings: int = 100000) -> List[Pairing]:
     """
     Generate feasible pairings starting and ending at the base city.
-    A pairing can have 1-4+ flights following FAA rules.
-    
-    Supports:
-    - Multi-day pairings with overnight stays
-    - Deadhead flights (crew as passenger) to reach destinations
+    A pairing can have 1-4 flights following FAA rules.
     
     For large datasets, limits total pairings to max_pairings for performance.
     """
@@ -302,8 +249,6 @@ def generate_pairings(flights: List[Flight], base_city: str, max_flights: int = 
             flights_by_date[date_key] = []
         flights_by_date[date_key].append(flight)
     
-    sorted_dates = sorted(flights_by_date.keys())
-    
     # Pre-index flights by departure station and date for faster lookups
     flights_by_station_date = {}
     for flight in flights:
@@ -312,45 +257,13 @@ def generate_pairings(flights: List[Flight], base_city: str, max_flights: int = 
             flights_by_station_date[key] = []
         flights_by_station_date[key].append(flight)
     
-    # Also index by arrival station for deadhead lookups
-    flights_by_arrival_station_date = {}
-    for flight in flights:
-        key = (flight.arrival_station, flight.arrival_date.date())
-        if key not in flights_by_arrival_station_date:
-            flights_by_arrival_station_date[key] = []
-        flights_by_arrival_station_date[key].append(flight)
-    
-    # Helper function to find connecting flights efficiently (same day or with overnight)
-    def find_connecting_flights(prev_flight, check_overnight=False):
-        result = []
-        # Same day connections
+    # Helper function to find connecting flights efficiently
+    def find_connecting_flights(prev_flight):
         key = (prev_flight.arrival_station, prev_flight.arrival_date.date())
         candidates = flights_by_station_date.get(key, [])
-        for f in candidates:
-            can_conn, needs_overnight = can_connect_flights(prev_flight, f, allow_overnight=False)
-            if can_conn:
-                result.append((f, needs_overnight))
-        
-        # Next day connections (overnight stay)
-        if check_overnight and allow_overnight:
-            next_date = prev_flight.arrival_date.date() + timedelta(days=1)
-            key = (prev_flight.arrival_station, next_date)
-            candidates = flights_by_station_date.get(key, [])
-            for f in candidates:
-                can_conn, needs_overnight = can_connect_flights(prev_flight, f, allow_overnight=True)
-                if can_conn and needs_overnight:
-                    result.append((f, True))
-        
-        return result
+        return [f for f in candidates if can_connect_flights(prev_flight, f)]
     
-    # Helper to find deadhead flights to reach a destination
-    def find_deadhead_flights(from_city: str, to_city: str, date):
-        """Find flights that can be used to deadhead from one city to another"""
-        key = (from_city, date)
-        candidates = flights_by_station_date.get(key, [])
-        return [f for f in candidates if f.arrival_station == to_city]
-    
-    # Generate single-flight pairings for flights that end at base
+    # Generate single-flight pairings for flights that end at base (deadhead home)
     for date, day_flights in flights_by_date.items():
         inbound_only = [f for f in day_flights if f.arrival_station == base_city]
         for flight in inbound_only:
@@ -359,35 +272,13 @@ def generate_pairings(flights: List[Flight], base_city: str, max_flights: int = 
             pairing = Pairing(
                 flights=[flight],
                 start_city=flight.departure_station,
-                end_city=base_city,
-                deadhead_flights=[],
-                hotel_nights=0
+                end_city=base_city
             )
             if (pairing.total_flying_time <= MAX_FLYING_TIME_PER_DUTY and
                 pairing.elapsed_time <= MAX_ELAPSED_TIME_PER_DUTY):
                 pairings.append(pairing)
         if len(pairings) >= max_pairings:
             break
-    
-    # Generate single-flight pairings for any flight (crew stays at destination)
-    if allow_overnight:
-        for date, day_flights in flights_by_date.items():
-            if len(pairings) >= max_pairings:
-                break
-            outbound_only = [f for f in day_flights if f.departure_station == base_city]
-            for flight in outbound_only:
-                if len(pairings) >= max_pairings:
-                    break
-                pairing = Pairing(
-                    flights=[flight],
-                    start_city=base_city,
-                    end_city=flight.arrival_station,
-                    deadhead_flights=[],
-                    hotel_nights=1  # Will need to stay somewhere
-                )
-                if (pairing.total_flying_time <= MAX_FLYING_TIME_PER_DUTY and
-                    pairing.elapsed_time <= MAX_ELAPSED_TIME_PER_DUTY):
-                    pairings.append(pairing)
     
     # Generate 2-flight round-trip pairings (base -> city -> base) - most efficient
     for date, day_flights in flights_by_date.items():
@@ -398,140 +289,26 @@ def generate_pairings(flights: List[Flight], base_city: str, max_flights: int = 
         for out_flight in outbound:
             if len(pairings) >= max_pairings:
                 break
+            # Find return flights using index
+            key = (out_flight.arrival_station, out_flight.arrival_date.date())
+            return_candidates = flights_by_station_date.get(key, [])
+            return_flights = [f for f in return_candidates 
+                           if f.arrival_station == base_city and can_connect_flights(out_flight, f)]
             
-            # Same day return flights
-            connecting = find_connecting_flights(out_flight, check_overnight=False)
-            for ret_flight, needs_overnight in connecting:
-                if ret_flight.arrival_station == base_city:
-                    pairing = Pairing(
-                        flights=[out_flight, ret_flight],
-                        start_city=base_city,
-                        end_city=base_city,
-                        deadhead_flights=[],
-                        hotel_nights=0
-                    )
-                    if (pairing.total_flying_time <= MAX_FLYING_TIME_PER_DUTY and
-                        pairing.elapsed_time <= MAX_ELAPSED_TIME_PER_DUTY):
-                        pairings.append(pairing)
-                        if len(pairings) >= max_pairings:
-                            break
-            
-            # Overnight stay and next day return (multi-day pairing)
-            if allow_overnight:
-                connecting_overnight = find_connecting_flights(out_flight, check_overnight=True)
-                for ret_flight, needs_overnight in connecting_overnight:
-                    if ret_flight.arrival_station == base_city and needs_overnight:
-                        pairing = Pairing(
-                            flights=[out_flight, ret_flight],
-                            start_city=base_city,
-                            end_city=base_city,
-                            deadhead_flights=[],
-                            hotel_nights=1
-                        )
-                        if (pairing.total_flying_time <= MAX_FLYING_TIME_HORIZON and  # Allow more time for multi-day
-                            pairing.total_work_time <= MAX_WORK_TIME_PER_DUTY * 2):  # Allow 2 days of work
-                            pairings.append(pairing)
-                            if len(pairings) >= max_pairings:
-                                break
-    
-    # Determine search limits based on dataset size
-    large_dataset = len(flights) > 5000
-    non_base_search_limit = 200 if large_dataset else 50
-    dh_search_limit = 20 if large_dataset else 5
-    
-    # Generate pairings with deadhead flights (crew travels as passenger to reach a flight)
-    if allow_deadhead:
-        for date, day_flights in flights_by_date.items():
-            if len(pairings) >= max_pairings:
-                break
-            
-            # Find flights not departing from base that could use crew
-            non_base_flights = [f for f in day_flights if f.departure_station != base_city]
-            
-            for target_flight in non_base_flights[:non_base_search_limit]:
-                if len(pairings) >= max_pairings:
-                    break
-                
-                # Find deadhead flight to get to the target flight's departure
-                deadhead_flights_to = find_deadhead_flights(base_city, target_flight.departure_station, date)
-                
-                for dh_flight in deadhead_flights_to[:dh_search_limit]:
-                    # Check if deadhead arrives in time for target flight
-                    can_conn, _ = can_connect_flights(dh_flight, target_flight, allow_overnight=False)
-                    if not can_conn:
-                        continue
-                    
-                    # If target flight returns to base, create pairing
-                    if target_flight.arrival_station == base_city:
-                        pairing = Pairing(
-                            flights=[dh_flight, target_flight],
-                            start_city=base_city,
-                            end_city=base_city,
-                            deadhead_flights=[0],  # First flight is deadhead
-                            hotel_nights=0
-                        )
-                        if (pairing.total_flying_time <= MAX_FLYING_TIME_PER_DUTY and
-                            pairing.total_work_time <= MAX_WORK_TIME_PER_DUTY):
-                            pairings.append(pairing)
-                            if len(pairings) >= max_pairings:
-                                break
-                    
-                    # Find connecting return flights from target's arrival
-                    return_flights = find_connecting_flights(target_flight, check_overnight=allow_overnight)
-                    for ret_flight, needs_overnight in return_flights[:dh_search_limit]:
-                        if ret_flight.arrival_station == base_city:
-                            hotel_nights = 1 if needs_overnight else 0
-                            pairing = Pairing(
-                                flights=[dh_flight, target_flight, ret_flight],
-                                start_city=base_city,
-                                end_city=base_city,
-                                deadhead_flights=[0],  # First flight is deadhead
-                                hotel_nights=hotel_nights
-                            )
-                            max_fly = MAX_FLYING_TIME_HORIZON if needs_overnight else MAX_FLYING_TIME_PER_DUTY
-                            max_work = MAX_WORK_TIME_PER_DUTY * (2 if needs_overnight else 1)
-                            if (pairing.total_flying_time <= max_fly and
-                                pairing.total_work_time <= max_work):
-                                pairings.append(pairing)
-                                if len(pairings) >= max_pairings:
-                                    break
-    
-    # Generate pairings with deadhead return (operational flight + deadhead back to base)
-    if allow_deadhead:
-        for date, day_flights in flights_by_date.items():
-            if len(pairings) >= max_pairings:
-                break
-            
-            # Find flights from base that don't return to base
-            outbound_flights = [f for f in day_flights if f.departure_station == base_city 
-                              and f.arrival_station != base_city]
-            
-            for out_flight in outbound_flights[:non_base_search_limit]:
-                if len(pairings) >= max_pairings:
-                    break
-                
-                # Find deadhead flights back to base from the arrival city
-                deadhead_backs = find_connecting_flights(out_flight, check_overnight=allow_overnight)
-                
-                for dh_back, needs_overnight in deadhead_backs[:dh_search_limit]:
-                    if dh_back.arrival_station == base_city:
-                        hotel_nights = 1 if needs_overnight else 0
-                        pairing = Pairing(
-                            flights=[out_flight, dh_back],
-                            start_city=base_city,
-                            end_city=base_city,
-                            deadhead_flights=[1],  # Second flight is deadhead
-                            hotel_nights=hotel_nights
-                        )
-                        max_fly = MAX_FLYING_TIME_HORIZON if needs_overnight else MAX_FLYING_TIME_PER_DUTY
-                        max_work = MAX_WORK_TIME_PER_DUTY * (2 if needs_overnight else 1)
-                        if (pairing.total_flying_time <= max_fly and
-                            pairing.total_work_time <= max_work):
-                            pairings.append(pairing)
-                            if len(pairings) >= max_pairings:
-                                break
+            for ret_flight in return_flights:
+                pairing = Pairing(
+                    flights=[out_flight, ret_flight],
+                    start_city=base_city,
+                    end_city=base_city
+                )
+                if (pairing.total_flying_time <= MAX_FLYING_TIME_PER_DUTY and
+                    pairing.elapsed_time <= MAX_ELAPSED_TIME_PER_DUTY):
+                    pairings.append(pairing)
+                    if len(pairings) >= max_pairings:
+                        break
     
     # For small datasets, also generate 4-flight pairings
+    # For large datasets, skip this expensive step
     if len(flights) <= 1000 and len(pairings) < max_pairings:
         for date, day_flights in flights_by_date.items():
             if len(pairings) >= max_pairings:
@@ -541,26 +318,24 @@ def generate_pairings(flights: List[Flight], base_city: str, max_flights: int = 
             for f1 in outbound1:
                 if len(pairings) >= max_pairings:
                     break
-                connecting_f1 = find_connecting_flights(f1, check_overnight=False)
+                connecting_f1 = find_connecting_flights(f1)
                 
-                for f2, _ in connecting_f1:
+                for f2 in connecting_f1:
                     if len(pairings) >= max_pairings:
                         break
-                    connecting_f2 = find_connecting_flights(f2, check_overnight=False)
+                    connecting_f2 = find_connecting_flights(f2)
                     
-                    for f3, _ in connecting_f2:
+                    for f3 in connecting_f2:
                         if len(pairings) >= max_pairings:
                             break
-                        connecting_f3 = [(f, o) for f, o in find_connecting_flights(f3, check_overnight=False) 
+                        connecting_f3 = [f for f in find_connecting_flights(f3) 
                                         if f.arrival_station == base_city]
                         
-                        for f4, _ in connecting_f3:
+                        for f4 in connecting_f3:
                             pairing = Pairing(
                                 flights=[f1, f2, f3, f4],
                                 start_city=base_city,
-                                end_city=base_city,
-                                deadhead_flights=[],
-                                hotel_nights=0
+                                end_city=base_city
                             )
                             if (pairing.total_flying_time <= MAX_FLYING_TIME_PER_DUTY and
                                 pairing.elapsed_time <= MAX_ELAPSED_TIME_PER_DUTY):
@@ -735,14 +510,10 @@ def calculate_fitness(chromosome: List[float], pairings: List[Pairing],
     used_crew = set(a.crew.emp_no for a in schedule.assignments)
     cost += len(used_crew) * CREW_USAGE_COST
     
-    # Add flying time cost, deadhead cost, and hotel cost
+    # Add flying time cost
     for assignment in schedule.assignments:
         hours = assignment.pairing.total_flying_time / 60
         cost += hours * assignment.crew.duty_cost_per_hour
-        # Add deadhead costs
-        cost += assignment.pairing.num_deadhead_flights * DEADHEAD_COST
-        # Add hotel costs
-        cost += assignment.pairing.hotel_nights * HOTEL_COST
     
     return cost, schedule
 
@@ -751,7 +522,7 @@ def greedy_solve(pairings: List[Pairing], flights: List[Flight],
                  captains: List[CrewMember], first_officers: List[CrewMember]) -> Tuple[Schedule, float]:
     """
     Greedy solver for large datasets - faster than GA but may not find optimal solution.
-    Sorts pairings by number of operational flights covered and greedily assigns crew.
+    Sorts pairings by number of flights covered and greedily assigns crew.
     """
     print("Using greedy solver for large dataset...")
     
@@ -760,14 +531,8 @@ def greedy_solve(pairings: List[Pairing], flights: List[Flight],
     crew_total_flying = {c.emp_no: 0 for c in captains + first_officers}
     crew_assignments_per_day = {c.emp_no: {} for c in captains + first_officers}
     
-    # Sort pairings by number of operational flights (non-deadhead), descending
-    # Also prefer pairings without hotel stays (cheaper)
-    def pairing_score(p):
-        operational_flights = len(p.flights) - p.num_deadhead_flights
-        # Higher score = better
-        return (operational_flights, -p.hotel_nights, -p.num_deadhead_flights)
-    
-    sorted_pairings = sorted(pairings, key=pairing_score, reverse=True)
+    # Sort pairings by number of flights (descending) to maximize coverage
+    sorted_pairings = sorted(pairings, key=lambda p: len(p.flights), reverse=True)
     
     captain_idx = 0
     fo_idx = 0
@@ -856,10 +621,6 @@ def greedy_solve(pairings: List[Pairing], flights: List[Flight],
     for assignment in schedule.assignments:
         hours = assignment.pairing.total_flying_time / 60
         cost += hours * assignment.crew.duty_cost_per_hour
-        # Add deadhead costs
-        cost += assignment.pairing.num_deadhead_flights * DEADHEAD_COST
-        # Add hotel costs
-        cost += assignment.pairing.hotel_nights * HOTEL_COST
     
     return schedule, cost
 
@@ -1020,33 +781,20 @@ def output_schedule_csv(schedule: Schedule, flights: List[Flight], output_path: 
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(['FlightNum', 'Date', 'DepartureTime', 'DepartureStation', 
-                        'ArrivalTime', 'ArrivalStation', 'Captain', 'CaptainRole', 
-                        'FirstOfficer', 'FirstOfficerRole'])
+                        'ArrivalTime', 'ArrivalStation', 'Captain', 'FirstOfficer'])
         
-        # Create flight to crew mapping with roles
+        # Create flight to crew mapping
         flight_assignments = {}
         for assignment in schedule.assignments:
-            for i, flight in enumerate(assignment.pairing.flights):
+            for flight in assignment.pairing.flights:
                 if flight.flight_id not in flight_assignments:
-                    flight_assignments[flight.flight_id] = {
-                        'Captain': '', 'CaptainRole': '',
-                        'FirstOfficer': '', 'FirstOfficerRole': ''
-                    }
-                role_for_flight = assignment.get_flight_role(i)
-                if assignment.role == 'Captain':
-                    flight_assignments[flight.flight_id]['Captain'] = assignment.crew.emp_no
-                    flight_assignments[flight.flight_id]['CaptainRole'] = role_for_flight
-                else:
-                    flight_assignments[flight.flight_id]['FirstOfficer'] = assignment.crew.emp_no
-                    flight_assignments[flight.flight_id]['FirstOfficerRole'] = role_for_flight
+                    flight_assignments[flight.flight_id] = {'Captain': '', 'FirstOfficer': ''}
+                flight_assignments[flight.flight_id][assignment.role] = assignment.crew.emp_no
         
         # Output each flight
         for flight in sorted(flights, key=lambda f: (f.departure_date, f.departure_time)):
-            fdata = flight_assignments.get(flight.flight_id, {})
-            captain = fdata.get('Captain', 'UNCOVERED')
-            captain_role = fdata.get('CaptainRole', '')
-            fo = fdata.get('FirstOfficer', 'UNCOVERED')
-            fo_role = fdata.get('FirstOfficerRole', '')
+            captain = flight_assignments.get(flight.flight_id, {}).get('Captain', 'UNCOVERED')
+            fo = flight_assignments.get(flight.flight_id, {}).get('FirstOfficer', 'UNCOVERED')
             
             writer.writerow([
                 flight.flight_num,
@@ -1056,9 +804,7 @@ def output_schedule_csv(schedule: Schedule, flights: List[Flight], output_path: 
                 flight.arrival_time.strftime('%H:%M'),
                 flight.arrival_station,
                 captain,
-                captain_role if captain != 'UNCOVERED' else '',
-                fo,
-                fo_role if fo != 'UNCOVERED' else ''
+                fo
             ])
     
     print(f"Schedule saved to {output_path}")
@@ -1068,9 +814,8 @@ def output_crew_schedule_csv(schedule: Schedule, crew_members: List[CrewMember],
     """Output crew-centric schedule to CSV file"""
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(['CrewID', 'BaseRole', 'Date', 'Flights', 'FlightRoles',
-                        'TotalFlyingTime(min)', 'TotalWorkTime(min)', 
-                        'DeadheadFlights', 'HotelNights', 'StartCity', 'EndCity'])
+        writer.writerow(['CrewID', 'Role', 'Date', 'Flights', 'TotalFlyingTime(min)', 
+                        'StartCity', 'EndCity'])
         
         # Group assignments by crew
         crew_pairings = {}
@@ -1084,15 +829,7 @@ def output_crew_schedule_csv(schedule: Schedule, crew_members: List[CrewMember],
             if crew.emp_no in crew_pairings:
                 for assignment in sorted(crew_pairings[crew.emp_no], 
                                         key=lambda a: a.pairing.flights[0].departure_date):
-                    # Build flight list with roles
-                    flight_parts = []
-                    role_parts = []
-                    for i, flight in enumerate(assignment.pairing.flights):
-                        flight_parts.append(flight.flight_num)
-                        role_parts.append(assignment.get_flight_role(i))
-                    
-                    flight_nums = ' -> '.join(flight_parts)
-                    flight_roles = ' -> '.join(role_parts)
+                    flight_nums = ' -> '.join([f.flight_num for f in assignment.pairing.flights])
                     date = assignment.pairing.flights[0].departure_date.strftime('%Y-%m-%d')
                     
                     writer.writerow([
@@ -1100,11 +837,7 @@ def output_crew_schedule_csv(schedule: Schedule, crew_members: List[CrewMember],
                         assignment.role,
                         date,
                         flight_nums,
-                        flight_roles,
                         assignment.pairing.total_flying_time,
-                        assignment.pairing.total_work_time,
-                        assignment.pairing.num_deadhead_flights,
-                        assignment.pairing.hotel_nights,
                         assignment.pairing.start_city,
                         assignment.pairing.end_city
                     ])
@@ -1126,38 +859,24 @@ def print_schedule_summary(schedule: Schedule, flights: List[Flight], crew_membe
     print(f"Uncovered flights: {len(schedule.uncovered_flights)}")
     print(f"Coverage rate: {covered_flights/total_flights*100:.1f}%")
     
-    # Count deadhead flights and hotel nights
-    total_deadhead = 0
-    total_hotel_nights = 0
-    for assignment in schedule.assignments:
-        total_deadhead += assignment.pairing.num_deadhead_flights
-        total_hotel_nights += assignment.pairing.hotel_nights
-    
-    print(f"\nTotal deadhead flights: {total_deadhead}")
-    print(f"Total hotel nights: {total_hotel_nights}")
-    
     # Crew statistics
     crew_flying_time = {}
-    crew_work_time = {}
     crew_duty_days = {}
     for assignment in schedule.assignments:
         emp = assignment.crew.emp_no
         if emp not in crew_flying_time:
             crew_flying_time[emp] = 0
-            crew_work_time[emp] = 0
             crew_duty_days[emp] = set()
         crew_flying_time[emp] += assignment.pairing.total_flying_time
-        crew_work_time[emp] += assignment.pairing.total_work_time
         crew_duty_days[emp].add(assignment.pairing.flights[0].departure_date.date())
     
     print(f"\nCrew members used: {len(crew_flying_time)}/{len(crew_members)}")
     
-    print("\nCrew utilization (flying/work hours):")
+    print("\nCrew utilization:")
     for emp in sorted(crew_flying_time.keys()):
         flying_hours = crew_flying_time[emp] / 60
-        work_hours = crew_work_time[emp] / 60
         days = len(crew_duty_days[emp])
-        print(f"  {emp}: {flying_hours:.1f}/{work_hours:.1f} hours over {days} duty days")
+        print(f"  {emp}: {flying_hours:.1f} hours over {days} duty days")
     
     if schedule.uncovered_flights:
         print(f"\nUncovered flight IDs: {sorted(schedule.uncovered_flights)[:20]}...")
